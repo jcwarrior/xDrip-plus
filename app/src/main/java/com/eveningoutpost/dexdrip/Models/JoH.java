@@ -4,7 +4,6 @@ import android.annotation.SuppressLint;
 import android.annotation.TargetApi;
 import android.app.Activity;
 import android.app.AlarmManager;
-import android.app.Notification;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.bluetooth.BluetoothAdapter;
@@ -56,6 +55,7 @@ import com.eveningoutpost.dexdrip.Home;
 import com.eveningoutpost.dexdrip.R;
 import com.eveningoutpost.dexdrip.UtilityModels.Constants;
 import com.eveningoutpost.dexdrip.UtilityModels.PersistentStore;
+import com.eveningoutpost.dexdrip.UtilityModels.Pref;
 import com.eveningoutpost.dexdrip.UtilityModels.XdripNotificationCompat;
 import com.eveningoutpost.dexdrip.utils.BestGZIPOutputStream;
 import com.eveningoutpost.dexdrip.utils.CipherUtils;
@@ -63,6 +63,7 @@ import com.eveningoutpost.dexdrip.xdrip;
 import com.google.common.primitives.Bytes;
 import com.google.common.primitives.UnsignedInts;
 import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import com.google.gson.reflect.TypeToken;
 
 import java.io.ByteArrayInputStream;
@@ -72,6 +73,8 @@ import java.io.FileOutputStream;
 import java.io.UnsupportedEncodingException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.net.URLEncoder;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -114,6 +117,9 @@ public class JoH {
         return qs(x, 2);
     }
 
+    // singletons to avoid repeated allocation
+    private static DecimalFormatSymbols dfs;
+    private static DecimalFormat df;
     public static String qs(double x, int digits) {
 
         if (digits == -1) {
@@ -127,12 +133,27 @@ public class JoH {
             }
         }
 
-        DecimalFormatSymbols symbols = new DecimalFormatSymbols();
-        symbols.setDecimalSeparator('.');
-        DecimalFormat df = new DecimalFormat("#", symbols);
-        df.setMaximumFractionDigits(digits);
-        df.setMinimumIntegerDigits(1);
-        return df.format(x);
+        if (dfs == null) {
+            final DecimalFormatSymbols local_dfs = new DecimalFormatSymbols();
+            local_dfs.setDecimalSeparator('.');
+            dfs = local_dfs; // avoid race condition
+        }
+
+        final DecimalFormat this_df;
+        // use singleton if on ui thread otherwise allocate new as DecimalFormat is not thread safe
+        if (Thread.currentThread().getId() == 1) {
+            if (df == null) {
+                final DecimalFormat local_df = new DecimalFormat("#", dfs);
+                local_df.setMinimumIntegerDigits(1);
+                df = local_df; // avoid race condition
+            }
+            this_df = df;
+        } else {
+            this_df = new DecimalFormat("#", dfs);
+        }
+
+        this_df.setMaximumFractionDigits(digits);
+        return this_df.format(x);
     }
 
     public static double ts() {
@@ -141,7 +162,8 @@ public class JoH {
 
     // TODO can we optimize this with System.currentTimeMillis ?
     public static long tsl() {
-        return new Date().getTime();
+        //return new Date().getTime();
+        return System.currentTimeMillis();
     }
 
     public static long msSince(long when) {
@@ -523,6 +545,18 @@ public class JoH {
         }.getType());
     }
 
+    private static Gson gson_instance;
+    public static Gson defaultGsonInstance() {
+     if (gson_instance == null) {
+         gson_instance = new GsonBuilder()
+                 .excludeFieldsWithoutExposeAnnotation()
+                 //.registerTypeAdapter(Date.class, new DateTypeAdapter())
+                 // .serializeSpecialFloatingPointValues()
+                 .create();
+     }
+     return gson_instance;
+    }
+
     public static String hourMinuteString() {
         // Date date = new Date();
         // SimpleDateFormat sd = new SimpleDateFormat("HH:mm");
@@ -610,7 +644,13 @@ public class JoH {
     public static void releaseWakeLock(PowerManager.WakeLock wl) {
         if (debug_wakelocks) Log.d(TAG, "releaseWakeLock: " + wl.toString());
         if (wl == null) return;
-        if (wl.isHeld()) wl.release();
+        if (wl.isHeld()) {
+            try {
+                wl.release();
+            } catch (Exception e) {
+                Log.e(TAG, "Error releasing wakelock: " + e);
+            }
+        }
     }
 
     public static PowerManager.WakeLock fullWakeLock(final String name, long millis) {
@@ -854,6 +894,10 @@ public class JoH {
         }
     }
 
+    public static void startService(Class c) {
+        xdrip.getAppContext().startService(new Intent(xdrip.getAppContext(), c));
+    }
+
     public static void goFullScreen(boolean fullScreen, View decorView) {
 
         if (fullScreen) {
@@ -892,7 +936,7 @@ public class JoH {
                 height, Bitmap.Config.ARGB_8888);
 
         final Canvas canvas = new Canvas(bitmap);
-        if (Home.getPreferencesBooleanDefaultFalse(SHOW_STATISTICS_PRINT_COLOR)) {
+        if (Pref.getBooleanDefaultFalse(SHOW_STATISTICS_PRINT_COLOR)) {
             Paint paint = new Paint();
             paint.setColor(Color.WHITE);
             paint.setStyle(Paint.Style.FILL);
@@ -911,7 +955,7 @@ public class JoH {
             final Canvas canvasf = new Canvas(bitmapf);
 
             Paint paint = new Paint();
-            if (Home.getPreferencesBooleanDefaultFalse(SHOW_STATISTICS_PRINT_COLOR)) {
+            if (Pref.getBooleanDefaultFalse(SHOW_STATISTICS_PRINT_COLOR)) {
                 paint.setColor(Color.WHITE);
                 paint.setStyle(Paint.Style.FILL);
                 canvasf.drawRect(0, 0, width, offset, paint);
@@ -1323,5 +1367,21 @@ public class JoH {
         crc.update(bytes, 0, bytes.length - 4);
         final long buffer_crc = UnsignedInts.toLong(ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getInt(bytes.length - 4));
         return buffer_crc == crc.getValue();
+    }
+
+    public static int parseIntWithDefault(String number, int radix, int defaultVal) {
+        try {
+            return Integer.parseInt(number, radix);
+       } catch (NumberFormatException e) {
+           Log.e(TAG, "Error parsing integer number = " + number + " radix = " + radix);
+           return defaultVal;
+       }
+    }
+
+    public static double roundDouble(double value, int places) {
+        if (places < 0) throw new IllegalArgumentException("Invalid decimal places");
+        BigDecimal bd = new BigDecimal(value);
+        bd = bd.setScale(places, RoundingMode.HALF_UP);
+        return bd.doubleValue();
     }
 }
